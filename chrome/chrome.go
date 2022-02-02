@@ -7,7 +7,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
+	"golang.org/x/net/http2"
+	
 	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 	"github.com/sensepost/gowitness/storage"
@@ -49,6 +50,12 @@ func (chrome *Chrome) Preflight(url *url.URL) (resp *http.Response, title string
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
 
+	// Configuring HTTP 2 transport upgrade for those assets that need it
+	err3 := http2.ConfigureTransport(transport)
+	if err3 != nil {
+		return
+	}
+
 	// purposefully ignore bad certs
 	client := http.Client{
 		Transport: transport,
@@ -59,6 +66,7 @@ func (chrome *Chrome) Preflight(url *url.URL) (resp *http.Response, title string
 		return
 	}
 	req.Header.Set("User-Agent", chrome.UserAgent)
+
 	req.Close = true
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(chrome.Timeout)*time.Second)
@@ -169,28 +177,43 @@ func (chrome *Chrome) Screenshot(url *url.URL) ([]byte, error) {
 		}
 	})
 
-	if chrome.FullPage {
-		// straight from: https://github.com/chromedp/examples/blob/849108f7da9f743bcdaef449699ed57cb4053379/screenshot/main.go
+	// create initial context (no timeout to prevent browser locking)
+	if err := chromedp.Run(ctx); err != nil{
+		return nil, err
+	}
 
-		if err := chromedp.Run(ctx, chromedp.Tasks{
-			chromedp.Navigate(url.String()),
-			chromedp.Sleep(time.Duration(chrome.Delay) * time.Second),
-			chromedp.FullScreenshot(&buf, 100),
-		}); err != nil {
-			return nil, err
-		}
+	// setup first context with a timeout, any pages that attempt to load beyond chrome.Timeout argument will trigger second
+	// context & screenshot capture
+	ctx1, cancel1 := context.WithTimeout(ctx, time.Duration(chrome.Timeout) * time.Second)
+	defer cancel1()
 
-	} else {
-		// normal viewport screenshot
-
-		if err := chromedp.Run(ctx, chromedp.Tasks{
-			chromedp.Navigate(url.String()),
-			chromedp.Sleep(time.Duration(chrome.Delay) * time.Second),
-			chromedp.CaptureScreenshot(&buf),
-		}); err != nil {
+	// run the first context and attempt to take a clean screenshot
+	// 		Note: we sleep with Delay but the context timeout is w/ timeout argument. Delay must be < timeout otherwise it'll be cancelled
+	//		though our screenshot will still be captured due to the second context
+	if err := chromedp.Run(ctx1, buildTasks(chrome,url,true,&buf)); err != nil {
+		// if the context timeout exceeded (e.g. on a long page load) then just take the screenshot w/ what loaded and move on
+		// do we need additional error handling here? in theory the preflight checks will prevent any pages that fail to completely load
+		if err2 := chromedp.Run(ctx, buildTasks(chrome,url,false,&buf)); err2 != nil {
 			return nil, err
 		}
 	}
 
 	return buf, nil
+}
+
+// build the tasks list for the contexts
+func buildTasks(chrome *Chrome, url *url.URL, doNavigate bool, buf *[]byte) chromedp.Tasks {
+	var actions chromedp.Tasks
+	if doNavigate {
+		actions = append(actions, chromedp.Navigate(url.String()))
+		if chrome.Delay > 0 {
+			actions = append(actions, chromedp.Sleep(time.Duration(chrome.Delay) * time.Second))
+		}
+	}
+	if chrome.FullPage{
+		actions = append(actions,chromedp.FullScreenshot(buf,100))
+	} else {
+		actions = append(actions,chromedp.CaptureScreenshot(buf))
+	}
+	return actions
 }
